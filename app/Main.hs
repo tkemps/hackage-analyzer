@@ -1,43 +1,45 @@
 {-# LANGUAGE UndecidableInstances, TemplateHaskell, Rank2Types, NoMonomorphismRestriction, FlexibleContexts, StandaloneDeriving, BangPatterns, DeriveAnyClass, DeriveGeneric #-}
-{-# OPTIONS_GHC -fno-warn-orphans -Wno-name-shadowing #-}
+{-# OPTIONS_GHC -fno-warn-orphans -Wno-name-shadowing -Wno-unused-do-bind #-}
 module Main where
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Compression.GZip as GZip
+import Control.DeepSeq ()
+import Control.Exception (evaluate)
 import Control.Lens
-import Data.Aeson
+import Data.Aeson hiding (Result)
 import Data.Aeson.Encode.Pretty
+import Data.Attoparsec.Text hiding (take)
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Lazy.Char8 as LBSC8
-import Data.Char (toLower)
+import Data.Char (toLower, isAlpha, isDigit)
+import Data.List ((!!))
 import Data.Maybe
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.String as Str
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
+import Data.Text.Read (double)
+import Data.Time.Calendar
+import Data.Time.Clock
+import Database.PostgreSQL.Simple
+import Database.PostgreSQL.Simple.ToField
+import Database.PostgreSQL.Simple.ToRow
+import Database.PostgreSQL.Simple.Types
+import qualified Filesystem as FS
+import qualified Filesystem.Path.CurrentOS as FScOS
 import Language.Haskell.Exts hiding (parse)
 import Language.Haskell.TH.Syntax (mkName, nameBase)
 import Network.Curl.Download
-import Protolude hiding (packageName, link)
+import qualified Options.Applicative as OptA
+import Protolude hiding (packageName, link, takeWhile, option)
 import Text.HTML.Scalpel
-import Text.Read
-import Data.Time.Clock
-import Data.Time.Calendar
-import Data.List ((!!))
-import Data.Text.Read
-import qualified Data.Text.Encoding as T
-import qualified Filesystem as FS
-import qualified Filesystem.Path.CurrentOS as FScOS
-import Database.PostgreSQL.Simple
-import Database.PostgreSQL.Simple.Types
-import Database.PostgreSQL.Simple.ToRow
-import Database.PostgreSQL.Simple.ToField
-import Options.Applicative
-import Control.DeepSeq ()
-import Control.Exception (evaluate)
+import Text.Read (read)
 --import qualified Control.Monad.Parallel as ParM
 --import Data.List.Split (chunksOf)
 --import System.IO.Unsafe
+import Control.Concurrent (threadDelay)
 
 underscorePrefixNamer :: Str.String -> FieldNamer
 underscorePrefixNamer prefix _ _ n =
@@ -77,6 +79,7 @@ data PackageInfo = PackageInfo {
   _version :: Text,
   _runDate :: UTCTime,
   _dateTimeSnapshot :: UTCTime,
+  _dependencies :: [(Text, Maybe Text)],
   _tags :: [Text],
   _description :: Text,
   _link :: URL,
@@ -127,6 +130,49 @@ scrapePackageProperties cat def f = do
                             else return Nothing)
   return (headDef def (catMaybes res))
 
+scrapeDependencies :: Scraper Text (Either Text [(Text, Maybe Text)])
+scrapeDependencies = scrapePackageProperties "Dependencies" (Right [])
+                     (\val -> do
+                         let res = parse dependenciesParser val
+                         return $ mkResult res)
+  where
+    mkResult :: Result [(Text, Maybe Text)] -> Either Text [(Text, Maybe Text)]
+    mkResult res = case res of
+                     Fail i ctx msg ->
+                       Left (T.concat ["Error in scrapeDependencies: ",
+                                        T.pack msg, "; context: ", T.pack $ show ctx, "; unused input: ", i])
+                     Partial cont -> 
+                       let res' = cont ""
+                       in mkResult res'
+                     Done _ r -> Right r
+    -- -- e.g. 'base (>=3 && <5), flexible-defaults (>=0.0.0.2), mersenne-random-pure64, mtl (>=1 && <3), mwc-random, random, stateref (==0.3.*), syb, template-haskell, th-extras [details]'
+    dependencyParser :: Parser (Text, Maybe Text)
+    dependencyParser = do
+          c1 <- T.singleton <$> letter
+          pkgWithoutC1 <- takeWhile1 (\c -> isAlpha c || isDigit c || c=='-')
+          let pkg = T.concat [c1, pkgWithoutC1]
+          skipSpace
+          mVersion <- choice [
+            do
+              char '('
+              versionSpec <- takeWhile1 (/=')')
+              string ")"
+              option ' ' (char ',')
+              skipSpace
+              return (Just versionSpec),
+            do
+              string ","
+              skipSpace
+              return Nothing,
+            do
+              string "["
+              takeWhile (\_ -> True)
+              return Nothing
+            ]
+          return (pkg, mVersion)
+    dependenciesParser :: Parser [(Text, Maybe Text)]
+    dependenciesParser = many dependencyParser
+
 scrapeDownloads :: Scraper Text (Int, Int)
 scrapeDownloads = scrapePackageProperties "Downloads" (0,0)
                   (\val -> do
@@ -153,7 +199,7 @@ scrapeMaintainers = scrapePackageProperties "Maintainer" "None"
 scrapeRating :: Scraper Text (Maybe Double)
 scrapeRating = scrapePackageProperties "Rating" Nothing
                   (\val -> do
-                      let er = double val
+                      let er = Data.Text.Read.double val
                       case er of
                         Left _ -> return Nothing
                         Right (x, _) -> return (Just x))
@@ -207,9 +253,12 @@ scrapeUploaded = scrapePackageProperties "Uploaded" d0
 replaceT :: Text -> Text -> Text -> Text
 replaceT old new = T.intercalate new . T.splitOn old
 
-packageMetaData :: UTCTime -> UTCTime -> PackageShortInfo -> Scraper Text PackageInfo
+packageMetaData :: UTCTime -> UTCTime -> PackageShortInfo
+  -> Scraper Text ([Text], PackageInfo)
 packageMetaData runDate currentDateTime ps = do
-  pVersions <- chroot ("table" @: ["class" @= "properties"] // tagSelector "tbody" // tagSelector "tr") (texts (tagSelector "td"))
+  pVersions <- chroot ("table" @: ["class" @= "properties"]
+                       // tagSelector "tbody"
+                       // tagSelector "tr") (texts (tagSelector "td"))
   (dl1, dl2) <- scrapeDownloads
   auth <- scrapeAuthors
   maint <- scrapeMaintainers
@@ -219,42 +268,50 @@ packageMetaData runDate currentDateTime ps = do
   u <- scrapeUploaded
   r <- scrapeRating
   cs <- scrapeCategories
+  eDeps <- scrapeDependencies
+  let (msgDeps, deps) = case eDeps of
+        Left msg -> ([msg], [])
+        Right deps -> ([], deps)
   let vs = fmap ((\v -> if T.takeEnd 7 v==" (info)" then T.dropEnd 7 v else v)
                  . T.strip) $ T.splitOn "," (T.concat pVersions)
-  return PackageInfo {
-    _packageName = view sPackageName $ ps,
-    _version = maximum vs,
-    _runDate = runDate,
-    _dateTimeSnapshot = currentDateTime,
-    _tags = view sTags $ ps,
-    _description = view sDescription $ ps,
-    _link = view sLink $ ps,
-    _categories = cs,
-    _versions = vs,
-    _extensionsDeclared = Set.empty,
-    _totalDownloads = dl1,
-    _thirtyDaysDownloads = dl2,
-    _authors = auth,
-    _maintainers = maint,
-    _homepage = hp,
-    _bugTracker = bt,
-    _sourceRepository = sr,
-    _uploaded = u,
-    _rating = r,
-    _size = 0
-    }
+  return (msgDeps,
+          PackageInfo {
+             _packageName = view sPackageName $ ps,
+             _version = maximum vs,
+             _runDate = runDate,
+             _dateTimeSnapshot = currentDateTime,
+             _dependencies = deps,
+             _tags = view sTags $ ps,
+             _description = view sDescription $ ps,
+             _link = view sLink $ ps,
+             _categories = cs,
+             _versions = vs,
+             _extensionsDeclared = Set.empty,
+             _totalDownloads = dl1,
+             _thirtyDaysDownloads = dl2,
+             _authors = auth,
+             _maintainers = maint,
+             _homepage = hp,
+             _bugTracker = bt,
+             _sourceRepository = sr,
+             _uploaded = u,
+             _rating = r,
+             _size = 0
+             })
 
 scrapeIndividualPackageMetaData :: UTCTime -> PackageShortInfo -> IO (Maybe PackageInfo)
 scrapeIndividualPackageMetaData runDate ps = do
   putStr (view sPackageName ps)
   currentDateTime <- getCurrentTime
-  pm <- scrapeURL (view sLink $ ps) (packageMetaData runDate currentDateTime ps)
+  pm <- scrapeURLWithRetry 10 (view sLink $ ps) (packageMetaData runDate currentDateTime ps)
   case pm of
     Nothing -> do
-      putStrLn (" Error while processing package "++(T.unpack $ view sPackageName ps))
+      putStr (", error while processing package "++(T.unpack $ view sPackageName ps))
       return Nothing
-    Just pm' -> do
+    Just (msgs, pm') -> do
       putStr (", uploaded: "++(show (view uploaded pm')))
+      putStr (", dependencies: "++(show (length (view dependencies pm'))))
+      mapM_ (\m -> putStrLn (T.unpack m)) msgs
       epd <- analyzePackageDetails pm'
       case epd of
         Left err -> do
@@ -264,6 +321,18 @@ scrapeIndividualPackageMetaData runDate ps = do
           putStrLn (", size: "++(show n)++", extensions: "++(show (length exts)))
           return (Just (pm' & extensionsDeclared .~ exts
                                & size .~ n))
+  where
+    scrapeURLWithRetry :: Int -> URL -> Scraper Text a -> IO (Maybe a)
+    scrapeURLWithRetry n link scraper = do
+      x <- scrapeURL link scraper
+      case x of
+        Nothing -> do
+          if n>0 then do
+            putStrLn ("\n***Scraping URL failed. Wait 10 s and try again.***" :: Text)
+            threadDelay 10000000 -- in µs
+            scrapeURLWithRetry (n-1) link scraper
+          else return Nothing
+        Just _ -> return x
 
 analyzePackageDetails :: PackageInfo -> IO (Either Str.String (Set Extension, Int64))
 analyzePackageDetails pm = do
@@ -305,8 +374,8 @@ instance (ToField a, ToField b, ToField c, ToField d, ToField e, ToField f,
          toField g, toField h, toField i, toField j, toField k, toField l, toField m,
          toField n, toField o, toField p, toField q, toField r, toField s, toField t]
 
-insertPackageMetaDate :: Connection -> [PackageInfo] -> IO Int64
-insertPackageMetaDate conn pms = do
+insertPackageMetaData :: Connection -> PackageInfo -> IO (Int64, Int64)
+insertPackageMetaData conn pms = do
   let values = fmap (\p -> (view packageName p,
                            view version p,
                            view runDate p,
@@ -326,8 +395,8 @@ insertPackageMetaDate conn pms = do
                            (PGArray $ view versions p) :: PGArray Text,
                            (PGArray $ view categories p) :: PGArray Text,
                            view link p,
-                           view description p)) pms
-  executeMany conn "insert into hackage.package_snapshot (\
+                           view description p)) [pms]
+  n1 <- executeMany conn "insert into hackage.package_snapshot (\
                    \ package_name, version, run_date, \
                    \ date_time_snapshot,\
                    \ downloads_total, downloads_30days,\
@@ -336,47 +405,77 @@ insertPackageMetaDate conn pms = do
                    \ uploaded, rating, size, extensions_declared, versions, \
                    \ categories, link, description)\
                    \ values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" values
+  let depValues = fmap (\d -> (view packageName pms,
+                               view version pms,
+                               view runDate pms,
+                               view _1 d,
+                               fromMaybe "" (view _2 d))) (view dependencies pms)
+  n2 <- executeMany conn "insert into hackage.dependency (\
+                   \ package_name, version, run_date,\
+                   \ package_name_dependency, version_dependency) \
+                   \ values (?,?,?,?,?)" depValues
+  return (n1,n2)
 
 data AppOptions = AppOptions {
   outputFileName :: FilePath,
-  postgresConnectString :: Text
+  postgresConnectString :: Text,
+  delete :: Bool
   }
 
-appOptions :: Parser AppOptions
+appOptions :: OptA.Parser AppOptions
 appOptions = AppOptions
-  <$> strOption
-  (long "outputFileName"
-   <> short 'o'
-   <> value "./full-hackage.json"
-   <> metavar "FILE"
-   <> help "File name for JSON output, default value: ./full-packages-meta-data.json")
-  <*> strOption (long "postgresConnectString"
-   <> short 'p'
-   <> value "host=localhost port=5432 dbname=postgres connect_timeout=10"
-   <> metavar "CONNECT"
-   <> help "Connect string for PostgreSQL data base, default value: 'host=localhost port=5432 dbname=postgres connect_timeout=10'")
+  <$> OptA.strOption (OptA.long "outputFileName"
+   <> OptA.short 'o'
+   <> OptA.value "./full-hackage.json"
+   <> OptA.metavar "FILE"
+   <> OptA.help "File name for JSON output, default value: ./full-packages-meta-data.json")
+  <*> OptA.strOption (OptA.long "postgresConnectString"
+   <> OptA.short 'p'
+   <> OptA.value "host=localhost port=5432 dbname=postgres connect_timeout=10"
+   <> OptA.metavar "CONNECT"
+   <>  OptA.help "Connect string for PostgreSQL data base, default value: 'host=localhost port=5432 dbname=postgres connect_timeout=10'")
+  <*> OptA.switch (OptA.long "delete"
+    <> OptA.short 'd'
+    <> OptA.help "Whether to delete the data for this run_date before inserting new data" )
 
-appInfo :: ParserInfo AppOptions
-appInfo = info (appOptions <**> helper)
-             ( fullDesc
-               <> progDesc "Analyse Hackage packages and write output to a JSON file."
-               <> header "Hackage Analysis Tool" )
+appInfo :: OptA.ParserInfo AppOptions
+appInfo = OptA.info (appOptions <**> OptA.helper)
+             ( OptA.fullDesc
+               <> OptA.progDesc "Analyse Hackage packages and write output to a JSON file."
+               <> OptA.header "Hackage Analysis Tool" )
 main :: IO ()
 main = do
-  appOpts <- execParser appInfo
+  appOpts <- OptA.execParser appInfo
   runDate <- getCurrentTime
   xs <- fromJust <$> scrapeHackageCompleteList packageListItems
-  pms <- mapM (\x -> do
-                       pm <- scrapeIndividualPackageMetaData runDate x
-                       evaluate (rnf pm)
-                       return pm)
-                   xs
-
+  putStrLn ("Found "++show (length xs)++" packages.")
+  pms <- bracket
+    (do
+        putStrLn ("Connect to postgresql database: "++
+                   (T.unpack $ postgresConnectString appOpts) :: Str.String)
+        connectPostgreSQL (T.encodeUtf8 $ postgresConnectString appOpts))
+    (\conn -> do
+        close conn
+        putStrLn ("Data base connection closed." :: Text))
+    (\conn -> do
+        when (delete appOpts) (
+          do
+            putStrLn ("Delete data for current run_date." :: Text)
+            execute conn "delete from hackage.dependency where run_date=?" [runDate]
+            execute conn "delete from hackage.package_snapshot where run_date=?" [runDate]
+            return ()
+          )
+        pms <- mapM (\x -> do
+                        pm <- scrapeIndividualPackageMetaData runDate x
+                        case pm of
+                          Just pm' -> do
+                            insertPackageMetaData conn pm'
+                            return ()
+                          Nothing -> do
+                            putStrLn (", no package meta data." :: Text)
+                            evaluate (rnf pm)
+                        return pm)
+                    xs
+        return pms)
   putStrLn ("Write JSON file to "++(outputFileName appOpts))
   LBS.writeFile (outputFileName appOpts) (encodePretty pms)
-
-  putStrLn ("Connect to postgresql database 'postgres': "++(T.unpack $ postgresConnectString appOpts) :: Str.String)
-  conn <- connectPostgreSQL (T.encodeUtf8 $ postgresConnectString appOpts)
-  putStr ("Write to postgresql database" :: Str.String)
-  res <- insertPackageMetaDate conn (catMaybes pms)
-  putStrLn (", result: "++show res)
