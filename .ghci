@@ -1,0 +1,3 @@
+:set -Wall
+:set stop :list
+:def hoogle \str -> return $ ":!hoogle -- --colour --count=15 \"" ++ str ++ "\""

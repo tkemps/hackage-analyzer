@@ -1,5 +1,5 @@
 name:                hackage-analyzer
-version:             0.2.0.0
+version:             0.3.0.0
 -- synopsis:
 -- description:
 homepage:            https://github.com/tkemps/hackage-analyzer#readme
@@ -16,8 +16,12 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   ghc-options:         -Wall
-  exposed-modules:     Lib
-  other-modules:       Lib.Prelude
+  exposed-modules:     Hackage.Scrape.CompleteList
+                     , Hackage.Scrape.PackageDetails
+                     , Hackage.Scrape.BuildStatus
+                     , Hackage.Scrape.Db
+                     , Hackage.Scrape.PackageInfo
+                     , Hackage.Scrape.PackageArchive
   build-depends:       base >= 4.7 && < 5
                      , protolude >= 0.1.6 && < 0.3
                      , scalpel >= 0.5.1 && < 0.6
@@ -40,6 +44,10 @@ library
                      , monad-parallel
                      , deepseq
                      , attoparsec
+                     , webdriver
+                     , transformers-base
+                     , filepath
+                     , directory
   default-language:    Haskell2010
   default-extensions:  OverloadedStrings, NoImplicitPrelude
 
@@ -70,18 +78,8 @@ executable hackage-analyzer-exe
                      , monad-parallel
                      , deepseq
                      , attoparsec
-  default-language:    Haskell2010
-  default-extensions:  OverloadedStrings, NoImplicitPrelude
-
-test-suite hackage-analyzer-test
-  type:                exitcode-stdio-1.0
-  hs-source-dirs:      test
-  main-is:             Spec.hs
-  build-depends:       base
-                     , hackage-analyzer
-                     , protolude >= 0.1.6 && < 0.3
-                     , text
-  ghc-options:         -Wall -threaded -rtsopts -with-rtsopts=-N
+                     , webdriver
+                     , transformers-base
   default-language:    Haskell2010
   default-extensions:  OverloadedStrings, NoImplicitPrelude
 
