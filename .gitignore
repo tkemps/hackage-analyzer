@@ -19,3 +19,8 @@ cabal.sandbox.config
 *.eventlog
 cabal.project.local
 .HTF/
+
+.Rproj.user
+.Rproj
+NAMESPACE
+/man/
