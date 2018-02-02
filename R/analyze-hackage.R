@@ -71,6 +71,6 @@ summary(lm(daysSinceUpload ~ downloads_30days + I(downloads_30days^2) + I(downlo
 summary(stepAIC(lm(log(downloads_30days, 10) ~ daysSinceUpload + I(daysSinceUpload^2) +
              numVersions + I(numVersions^2) +
              rating1 + size*sizeF + anyOk,
-           data = p1),
+           data = p1[downloads_30days>0]),
            k = log(nrow(p1), 2)))
 
