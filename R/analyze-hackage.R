@@ -7,9 +7,9 @@ library(MASS)
 drv <- dbDriver("PostgreSQL")
 tryCatch({
   con <- dbConnect(drv, host = "127.0.0.1", dbname = "postgres")
-  p <- data.table(dbGetQuery(con, "SELECT * FROM hackage.package_snapshot;"))
-  d <- data.table(dbGetQuery(con, "SELECT * FROM hackage.dependency;"))
-  b <- data.table(dbGetQuery(con, "SELECT * FROM hackage.build_status;"))
+  p <- data.table(dbGetQuery(con, "SELECT * FROM hackage.package_snapshot WHERE run_date = '2018-02-08';"))
+  d <- data.table(dbGetQuery(con, "SELECT * FROM hackage.dependency WHERE run_date = '2018-02-08';"))
+  b <- data.table(dbGetQuery(con, "SELECT * FROM hackage.build_status WHERE run_date = '2018-02-08';"))
 }, finally = {
   dbDisconnect(con)})
 

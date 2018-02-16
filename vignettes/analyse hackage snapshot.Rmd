@@ -1,0 +1,129 @@
+---
+title: "Analyse Hackage Snapshot"
+author: "Torsten Kemps-Benedix"
+date: "9.2.2018"
+output: html_document
+params:
+  run_date: !r as.Date("2018-02-14")
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+
+dbGetQuery1 <- function(con, sql, ...) {
+  data.table(dbGetQuery(con,
+    sqlInterpolate(ANSI(), 
+                   sql, 
+                   run_date = paste0("'", as.character(params$run_date), "'"),
+                   ...)))
+}
+
+psqlArray <- function(a) {
+  x <- substr(a, start = 2, stop = 1000)
+  x <- substr(x, start = 1, stop = nchar(x) - 1)
+  strsplit(x, ",")
+}
+```
+
+```{r libraries}
+library(ggplot2)
+library(DBI)
+library(RPostgreSQL)
+library(reshape)
+library(data.table)
+library(MASS)
+```
+
+# Load Data
+
+```{r load and enhance data}
+drv <- dbDriver("PostgreSQL")
+tryCatch({
+  con <- dbConnect(drv, host = "127.0.0.1", dbname = "postgres")
+  p <- dbGetQuery1(con, 
+                   "SELECT * FROM hackage.package_snapshot 
+                    WHERE run_date = ?run_date;")
+  d <- dbGetQuery1(con, 
+                   "SELECT * FROM hackage.dependency 
+                    WHERE run_date = ?run_date;")
+  b <- dbGetQuery1(con, 
+                   "SELECT * FROM hackage.build_status 
+                    WHERE run_date = ?run_date;")
+}, finally = {
+  dbDisconnect(con)})
+
+p[, `:=`(
+  daysSinceUpload = as.integer(Sys.Date() - as.Date(p$uploaded)),
+  categories1 = psqlArray(categories),
+  categories1l = sapply(psqlArray(categories), function(s) {
+    sort(gsub("\\\"", "", tolower(s)))}),
+  numVersions1 = sapply(psqlArray(versions), length)
+  )]
+
+setkey(p, package_name, version, run_date)
+setkey(d, package_name, version, run_date, package_name_dependency)
+setkey(b, package_name, version, run_date, ghc_version)
+
+p[, rating1 := ifelse(is.na(rating),0,rating)]
+p[, sizeF := factor(ifelse(size < 1000, 1, ifelse(size > 1e5, 3, 2)))]
+
+b1 <- b[, .(okForAnyGhcVersion = any(build_status == "OK"),
+            okForLatestGhc = any(ifelse(ghc_version == "8.2", build_status == "OK", FALSE))),
+        by = .(package_name, version, run_date)]
+setkey(b1, package_name, version, run_date)
+p1 <- b1[p[run_date >= as.Date("2018-01-30")]]
+p1[, okForAnyGhcVersion := ifelse(is.na(okForAnyGhcVersion), FALSE, okForAnyGhcVersion)]
+p1[, okForLatestGhc := ifelse(is.na(okForLatestGhc), FALSE, okForLatestGhc)]
+```
+
+We have found `r nrow(p)` packages in the snapshot of `r format(params$run_date)`. Most packages' current version was uploaded several years ago. The following diagram shows the time since upload for all packages. The blue line marks the median which is `r round(median(p1$daysSinceUpload/365.25), 2)` years and the green line shows the mean which is `r round(mean(p1$daysSinceUpload/365.25), 2)` years.
+
+```{r}
+ggplot(p1, aes(daysSinceUpload/365.25)) +
+  geom_histogram(bins = 50) +
+  xlab("years since upload") +
+  geom_vline(xintercept = median(p1$daysSinceUpload/365.25), col = "blue") +
+  geom_vline(xintercept = mean(p1$daysSinceUpload/365.25), col = "darkgreen")
+```
+
+```{r}
+cats <- gsub("\\\"", "", sort(unique(unlist(p1$categories1))))
+catsl <- unique(tolower(cats))
+```
+
+We currently have `r length(cats)` different categories. There are some cases where categories differ only by upper vs. lower case. We treat these as the same categories. After this clean up there remain `r length(catsl)` different categories.
+
+```{r categories}
+pc <- rbindlist(lapply(catsl,
+                       function(c) p1[sapply(p1$categories1l,
+                                             function(v) is.element(c, v)),
+                                      .(package_name, version, run_date,
+                                        downloads_total, downloads_30days,
+                                        okForAnyGhcVersion, okForLatestGhc, 
+                                        size, rating,
+                                        category = c)]))
+c <- pc[, .(no_packages = .N,
+            category_downloads_total = sum(downloads_total),
+            category_downloads_30days = sum(downloads_30days)),
+        by = category][order(category_downloads_30days, decreasing = TRUE)]
+pc <- merge(pc, c, by = "category")
+kable(c[1:100])
+```
+
+Most important packages in each of the most important categories:
+
+```{r}
+nPackages <- 20
+nCategories <- 40
+pcc <- pc[order(category, downloads_30days, decreasing = TRUE)
+          ][, .SD[1:nPackages], by = category
+            ][order(category_downloads_30days, decreasing = TRUE),
+              .(category, package_name, downloads_total, downloads_30days, 
+                downloads_30daysPctCat = round(100*downloads_30days/category_downloads_30days,1),
+                okForAnyGhcVersion, okForLatestGhc, sizeKB = round(size/1024,0), rating)]
+kable(pcc[category %in% c[1:nCategories, category]])
+```
+
